@@ -1,0 +1,96 @@
+version: '3.9'
+services:
+  master:
+    container_name: "${COMPOSE_PROJECT_NAME:-citus}_master"
+    image: "citusdata/citus:12.1.3"
+    ports: [ "${COORDINATOR_EXTERNAL_PORT:-5432}:5432" ]
+    labels: [ "com.citusdata.role=Master" ]
+    environment: &AUTH
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      PGUSER: "${POSTGRES_USER:-postgres}"
+      PGPASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_HOST_AUTH_METHOD: "${POSTGRES_HOST_AUTH_METHOD:-trust}"
+    volumes:
+      - ./01-schema-init.sql:/docker-entrypoint-initdb.d/01-schema-init.sql
+      - ./02-data-init.sql:/docker-entrypoint-initdb.d/02-data-init.sql
+  worker:
+    image: "citusdata/citus:12.1.3"
+    labels: [ "com.citusdata.role=Worker" ]
+    depends_on: [ manager ]
+    environment: *AUTH
+    command: "/wait-for-manager.sh"
+    volumes:
+      - healthcheck-volume:/healthcheck
+  manager:
+    container_name: "${COMPOSE_PROJECT_NAME:-citus}_manager"
+    image: "citusdata/membership-manager:0.3.0"
+    volumes:
+      - "${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock"
+      - healthcheck-volume:/healthcheck
+    depends_on: [ master ]
+    environment: *AUTH
+
+  redis-otus:
+    image: redis:6
+    hostname: redis-otus
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis/data:/data
+
+  rabbitmq-otus:
+    image: rabbitmq:3-management
+    hostname: rabbitmq-otus
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+      - "5671:5671"
+    volumes:
+      - ./rabbitmq/data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 30s
+      retries: 3
+
+  otus-highload-hw7:
+    image: recvezitor/otus-highload-hw7:latest
+    depends_on:
+      rabbitmq-otus:
+        condition: service_healthy
+      master:
+        condition: service_started
+      redis-otus:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      JAVA_OPTS_ADD: -XX:MinRAMPercentage=25 -XX:MaxRAMPercentage=50 -XX:+PrintFlagsFinal
+      DB_URL: postgresql://master:5432/postgres
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_POOL_SIZE: 100
+      DB_POOL_IDLE_TIME: PT30s
+      DB_POOL_MAX_TIME: PT60s
+      REDIS_HOST: redis://redis-otus:6379
+      RABBIT_VHOST: /
+      RABBIT_USERNAME: admin
+      RABBIT_PASSWORD: admin
+      RABBIT_HOSTNAME: rabbitmq-otus
+      RABBIT_PORT: 5672
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "1024M"
+        reservations:
+          cpus: "0.5"
+          memory: "256M"
+
+volumes:
+  healthcheck-volume:
